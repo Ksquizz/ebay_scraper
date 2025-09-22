@@ -1,0 +1,404 @@
+import requests
+from bs4 import BeautifulSoup
+import json
+import numpy as np
+import time
+import re
+from urllib.parse import quote
+from statistics import median
+
+# ========================
+# CONFIGURATION
+# ========================
+MAX_REQUESTS = 50
+REQUEST_DELAY = 2  # Seconds between requests
+
+# Exclusion filters
+EXCLUDE_KEYWORDS = ["for parts", "spares", "faulty", "not working", "broken", "bundle", "system", "pc", "lot", "job lot", "combo", "mining", "damaged", "repair"]
+
+# ========================
+# Fixed eBay Scraping Functions
+# ========================
+def get_session():
+    """Create a requests session with headers that look like a real browser"""
+    session = requests.Session()
+    session.headers.update({
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-GB,en;q=0.9,en-US;q=0.8',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Connection': 'keep-alive',
+        'Upgrade-Insecure-Requests': '1',
+        'Sec-Fetch-Dest': 'document',
+        'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-Site': 'none',
+        'Cache-Control': 'max-age=0',
+    })
+    return session
+
+def extract_prices_from_html(html_content, query_terms):
+    """
+    Extract prices from eBay HTML using multiple methods
+    Since eBay changed structure, we'll use regex and text analysis
+    """
+    prices = []
+    titles_and_prices = []
+    
+    soup = BeautifulSoup(html_content, 'html.parser')
+    
+    # Method 1: Find all price patterns in the entire HTML
+    price_pattern = r'£([\d,]+\.?\d*)'
+    all_prices = re.findall(price_pattern, html_content)
+    
+    print(f"   Found {len(all_prices)} total price patterns")
+    
+    # Method 2: Look for structured data (JSON-LD, data attributes)
+    script_tags = soup.find_all('script', type='application/ld+json')
+    json_prices = []
+    
+    for script in script_tags:
+        try:
+            data = json.loads(script.string)
+            # Extract prices from structured data if available
+            if isinstance(data, list):
+                for item in data:
+                    if 'offers' in item and 'price' in item['offers']:
+                        json_prices.append(float(item['offers']['price']))
+        except:
+            continue
+    
+    print(f"   Found {len(json_prices)} prices in structured data")
+    
+    # Method 3: Look for listings with context
+    # eBay often has the item info in data attributes or nearby text
+    all_text = soup.get_text()
+    
+    # Split into potential listing blocks
+    # Look for patterns like "GTX 1060" followed by a price within reasonable distance
+    query_words = [word.lower() for word in query_terms.split() if len(word) > 2]
+    
+    # Find sections that mention our GPU
+    relevant_sections = []
+    lines = all_text.split('\n')
+    
+    for i, line in enumerate(lines):
+        line_lower = line.lower().strip()
+        if any(word in line_lower for word in query_words) and len(line_lower) > 10:
+            # Get surrounding lines for context
+            start = max(0, i-3)
+            end = min(len(lines), i+4)
+            section = ' '.join(lines[start:end])
+            relevant_sections.append(section)
+    
+    print(f"   Found {len(relevant_sections)} relevant sections")
+    
+    # Extract prices from relevant sections
+    section_prices = []
+    for section in relevant_sections:
+        # Skip sections with exclusion keywords
+        section_lower = section.lower()
+        if any(keyword in section_lower for keyword in EXCLUDE_KEYWORDS):
+            continue
+            
+        # Find prices in this section
+        section_price_matches = re.findall(price_pattern, section)
+        for price_str in section_price_matches:
+            try:
+                price = float(price_str.replace(',', ''))
+                if 20 <= price <= 3000:  # Reasonable GPU price range
+                    section_prices.append(price)
+                    titles_and_prices.append((section[:100], price))
+            except ValueError:
+                continue
+    
+    print(f"   Found {len(section_prices)} contextual prices")
+    
+    # Combine all methods, prioritizing contextual prices
+    if section_prices:
+        prices = section_prices
+    elif json_prices:
+        prices = json_prices
+    else:
+        # Fall back to all prices, filtered by range
+        for price_str in all_prices:
+            try:
+                price = float(price_str.replace(',', ''))
+                if 30 <= price <= 2500:  # GPU price range
+                    prices.append(price)
+            except ValueError:
+                continue
+    
+    # Remove obvious duplicates (same price appearing many times)
+    if len(prices) > 10:
+        price_counts = {}
+        for price in prices:
+            price_counts[price] = price_counts.get(price, 0) + 1
+        
+        # Remove prices that appear more than 30% of the time (likely UI elements)
+        max_allowed = len(prices) * 0.3
+        filtered_prices = [price for price, count in price_counts.items() if count <= max_allowed]
+        if len(filtered_prices) >= 5:
+            prices = filtered_prices
+    
+    return prices, titles_and_prices
+
+def scrape_ebay_sold(query, max_results=50):
+    """
+    Scrape eBay sold listings using updated method
+    """
+    session = get_session()
+    all_prices = []
+    all_titles_prices = []
+    
+    # Try multiple URL formats
+    base_urls = [
+        "https://www.ebay.co.uk/sch/i.html",
+        "https://www.ebay.co.uk/sch/27386/i.html",  # Direct graphics card category
+    ]
+    
+    for base_url in base_urls:
+        print(f"🔍 Trying URL format: {base_url}")
+        
+        # Build parameters
+        params = {
+            '_nkw': query,
+            '_sacat': '27386',  # Graphics cards category
+            'LH_Sold': '1',     # Sold listings only
+            'LH_Complete': '1', # Completed listings
+            '_ipg': '240',      # Max items per page
+            'rt': 'nc',
+            '_udlo': '30',      # Minimum price £30
+            '_udhi': '2500',    # Maximum price £2500
+            '_sop': '13',       # Sort by: time ending soonest
+        }
+        
+        # Build full URL
+        param_string = "&".join([f"{k}={v}" for k, v in params.items()])
+        full_url = f"{base_url}?{param_string}"
+        
+        try:
+            print(f"   Fetching: {query}")
+            response = session.get(full_url, timeout=30)
+            
+            if response.status_code != 200:
+                print(f"   ❌ Status code: {response.status_code}")
+                continue
+                
+            print(f"   ✅ Got response ({len(response.content)} bytes)")
+            
+            # Extract prices using our new method
+            prices, titles_prices = extract_prices_from_html(response.text, query)
+            
+            if prices:
+                all_prices.extend(prices)
+                all_titles_prices.extend(titles_prices)
+                print(f"   ✅ Found {len(prices)} prices")
+                break  # Success with this URL format
+            else:
+                print(f"   ⚠️ No prices found with this URL format")
+                
+        except Exception as e:
+            print(f"   ❌ Error: {e}")
+            continue
+        
+        time.sleep(REQUEST_DELAY)
+    
+    # Remove duplicates while preserving order
+    seen_prices = set()
+    unique_prices = []
+    for price in all_prices:
+        if price not in seen_prices:
+            seen_prices.add(price)
+            unique_prices.append(price)
+    
+    # Limit results
+    if len(unique_prices) > max_results:
+        unique_prices = unique_prices[:max_results]
+    
+    print(f"✅ Total unique prices found: {len(unique_prices)}")
+    if unique_prices:
+        print(f"   Price range: £{min(unique_prices):.2f} - £{max(unique_prices):.2f}")
+        print(f"   Sample prices: {unique_prices[:5]}")
+    
+    return unique_prices
+
+def filter_outliers(prices):
+    """Remove outliers using IQR method"""
+    if len(prices) < 3:
+        mean_price = np.mean(prices) if prices else np.nan
+        return prices, mean_price, (np.nan, np.nan), np.nan
+
+    prices = np.array(prices)
+    
+    # IQR method
+    q1, q3 = np.percentile(prices, [25, 75])
+    iqr = q3 - q1
+    lower, upper = q1 - 1.5 * iqr, q3 + 1.5 * iqr
+    iqr_filtered = prices[(prices >= lower) & (prices <= upper)]
+
+    # If IQR removes too many, use a more conservative approach
+    if len(iqr_filtered) < len(prices) * 0.6:
+        # Use median absolute deviation instead
+        median_price = np.median(prices)
+        mad = np.median(np.abs(prices - median_price))
+        mad_lower, mad_upper = median_price - 3*mad, median_price + 3*mad
+        filtered = prices[(prices >= mad_lower) & (prices <= mad_upper)]
+    else:
+        filtered = iqr_filtered
+
+    # Calculate trimmed mean
+    if len(filtered) >= 6:
+        sorted_filtered = np.sort(filtered)
+        trim_count = max(1, int(len(sorted_filtered) * 0.1))
+        trimmed = sorted_filtered[trim_count:-trim_count]
+    else:
+        trimmed = filtered
+
+    corrected_mean = np.mean(trimmed) if len(trimmed) > 0 else np.nan
+    stddev_mean = np.std(filtered) if len(filtered) > 0 else np.nan
+    
+    return filtered.tolist(), corrected_mean, (lower, upper), stddev_mean
+
+def process_gpu_list(gpu_list, output_file="gpu_prices.json"):
+    """
+    Process a list of GPUs and scrape their prices
+    """
+    
+    gpu_comparison = []
+    samples_log = []
+    stats_log = []
+    
+    print(f"🚀 Starting price scraping for {len(gpu_list)} GPUs...")
+    
+    for i, gpu_info in enumerate(gpu_list, 1):
+        # Extract GPU name and VRAM
+        gpu_name = gpu_info.get('name', gpu_info.get('gpu', gpu_info.get('NVIDIA GPU', '')))
+        vram = gpu_info.get('vram', gpu_info.get('VRAM', ''))
+        
+        if not gpu_name:
+            print(f"⚠️ Skipping GPU {i}: No name found")
+            continue
+            
+        full_name = f"{gpu_name} {vram}".strip()
+        print(f"\n📊 Processing {i}/{len(gpu_list)}: {full_name}")
+        print("=" * 50)
+        
+        # Build search query - try multiple variations
+        queries = [
+            f"{gpu_name} {vram}".strip(),
+            f"{gpu_name} {vram} graphics card".strip(),
+            gpu_name.strip()
+        ]
+        
+        all_prices = []
+        
+        # Try each query variation
+        for query in queries:
+            if query:
+                print(f"🔍 Query: '{query}'")
+                prices = scrape_ebay_sold(query, max_results=30)
+                all_prices.extend(prices)
+                
+                if len(all_prices) >= 15:  # Got enough data
+                    break
+                    
+                time.sleep(1)  # Brief pause between queries
+        
+        # Remove duplicates
+        unique_prices = list(set(all_prices))
+        
+        if not unique_prices:
+            print(f"❌ No prices found for {full_name}")
+            gpu_comparison.append({
+                "GPU": full_name,
+                "Average_Price": None,
+                "Sample_Count": 0,
+                "Price_Range": "No data",
+                "Status": "No data found"
+            })
+            continue
+        
+        # Process prices
+        raw_mean = np.mean(unique_prices)
+        filtered_prices, corrected_mean, iqr_range, stddev = filter_outliers(unique_prices)
+        
+        # Store results
+        gpu_data = {
+            "GPU": full_name,
+            "Average_Price": round(corrected_mean, 2) if not np.isnan(corrected_mean) else None,
+            "Sample_Count": len(filtered_prices),
+            "Raw_Average": round(raw_mean, 2),
+            "Price_Range": f"£{min(filtered_prices):.2f} - £{max(filtered_prices):.2f}" if filtered_prices else "No data",
+            "Standard_Deviation": round(stddev, 2) if not np.isnan(stddev) else None,
+            "Median_Price": round(np.median(filtered_prices), 2) if filtered_prices else None,
+            "Status": "Success" if not np.isnan(corrected_mean) else "Insufficient data"
+        }
+        
+        gpu_comparison.append(gpu_data)
+        
+        # Log detailed stats
+        samples_log.append({
+            "GPU": full_name,
+            "Total_Samples": len(unique_prices),
+            "Valid_Samples": len(filtered_prices),
+            "Outliers_Removed": len(unique_prices) - len(filtered_prices),
+            "Queries_Tried": len([q for q in queries if q])
+        })
+        
+        print(f"📈 Results for {full_name}:")
+        print(f"   Average: £{corrected_mean:.2f}")
+        print(f"   Samples: {len(filtered_prices)}")
+        print(f"   Range: £{min(filtered_prices):.2f} - £{max(filtered_prices):.2f}")
+    
+    # Compile final results
+    results = {
+        "gpu_comparison": gpu_comparison,
+        "detailed_samples": samples_log,
+        "metadata": {
+            "scraping_timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "total_gpus": len(gpu_list),
+            "successful_scrapes": len([g for g in gpu_comparison if g["Average_Price"] is not None]),
+            "method": "Updated web scraping (2025)"
+        }
+    }
+    
+    # Save to JSON
+    with open(output_file, 'w', encoding='utf-8') as f:
+        json.dump(results, f, indent=2, ensure_ascii=False)
+    
+    print(f"\n✅ Results saved to {output_file}")
+    
+    # Print summary
+    successful = [g for g in gpu_comparison if g["Average_Price"] is not None]
+    print(f"\n📈 FINAL SUMMARY:")
+    print(f"Total GPUs processed: {len(gpu_comparison)}")
+    print(f"Successful price finds: {len(successful)}")
+    print(f"Success rate: {len(successful)/len(gpu_comparison)*100:.1f}%")
+    
+    if successful:
+        print(f"\n💰 Price Results:")
+        for gpu in successful:
+            print(f"  {gpu['GPU']}: £{gpu['Average_Price']} (n={gpu['Sample_Count']})")
+    
+    return results
+
+# ========================
+# Example Usage
+# ========================
+if __name__ == "__main__":
+    # Test with popular, common GPUs (more likely to have sold listings)
+    test_gpus = [
+        {"name": "GTX 1060", "vram": "6GB"},    # Very common
+        {"name": "GTX 1660", "vram": "6GB"},    # Common
+        {"name": "RTX 3060", "vram": "12GB"},   # Popular current gen
+    ]
+    
+    print("🌐 GPU Price Scraper - Fixed Version (2025)")
+    print("Using updated eBay scraping methods")
+    print("=" * 60)
+    
+    # Process the GPUs
+    results = process_gpu_list(test_gpus, "gpu_prices_fixed.json")
+    
+    print(f"\n🎉 Scraping complete!")
+    print(f"Check 'gpu_prices_fixed.json' for detailed results")
