@@ -5,6 +5,7 @@ Based on the working GPU scraper, now supports any item type
 Supports Excel/JSON input and output formats
 """
 
+import random
 import requests
 from bs4 import BeautifulSoup
 import json
@@ -20,14 +21,50 @@ from datetime import datetime
 # ========================
 # CONFIGURATION
 # ========================
-REQUEST_DELAY = 2  # Seconds between requests
+REQUEST_DELAY_MIN = 3  # Minimum seconds between requests
+REQUEST_DELAY_MAX = 8  # Maximum seconds between requests
 DEFAULT_PRICE_RANGE = (5, 5000)  # Default min/max prices
+MAX_REQUESTS_PER_SESSION = 5  # Reset session after this many requests
+RETRY_ATTEMPTS = 3  # Number of retry attempts for failed requests
+
+# Rotate through different user agents
+USER_AGENTS = [
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/121.0',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15',
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+]
 
 # Common exclusion filters (can be customized)
 DEFAULT_EXCLUDE_KEYWORDS = [
     "for parts", "spares", "faulty", "not working", "broken", "bundle", 
     "system", "lot", "job lot", "combo", "damaged", "repair", "untested"
 ]
+USER_FILTERS_FILE = "user_filters.json"
+
+def load_user_filters():
+    if os.path.exists(USER_FILTERS_FILE):
+        try:
+            with open(USER_FILTERS_FILE, "r", encoding="utf-8") as f:
+                user_filters = json.load(f)
+            if isinstance(user_filters, dict):
+                print(f"✅ Loaded {len(user_filters)} user-defined filters from {USER_FILTERS_FILE}")
+                return user_filters
+        except Exception as e:
+            print(f"⚠️ Could not load user filters: {e}")
+    return {}
+
+
+    # Merge user filters into global FILTER_PROFILES
+def merge_filters(default_profiles):
+    user_filters = load_user_filters()
+    merged = default_profiles.copy()
+    for key, keywords in user_filters.items():
+        if isinstance(keywords, list):
+            merged[key] = keywords
+    return merged
 
 # Predefined filter profiles for different item types
 FILTER_PROFILES = {
@@ -94,11 +131,17 @@ FILTER_PROFILES = {
     ]
 }
 
+
 class UniversalPriceScraper:
-    def __init__(self, delay=REQUEST_DELAY, exclude_keywords=None, price_range=None, filter_profile=None):
-        self.delay = delay
+    def __init__(self, delay=None, exclude_keywords=None, price_range=None, filter_profile=None):
+        # Anti-detection settings
+        self.delay_min = REQUEST_DELAY_MIN
+        self.delay_max = REQUEST_DELAY_MAX
         self.price_range = price_range or DEFAULT_PRICE_RANGE
-        self.session = self._create_session()
+        self.session = None
+        self.request_count = 0
+        self.session_requests = 0
+        self.last_request_time = 0
         
         # Set up exclusion keywords
         if exclude_keywords is not None:
@@ -111,115 +154,257 @@ class UniversalPriceScraper:
         
         self.filter_profile = filter_profile
         
-    def _create_session(self):
-        """Create a requests session with proper headers"""
-        session = requests.Session()
-        session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        # Initialize first session
+        self._create_new_session()
+        
+    def _create_new_session(self):
+        """Create a new session with random user agent and headers for anti-detection"""
+        self.session = requests.Session()
+        
+        # Random user agent
+        user_agent = random.choice(USER_AGENTS)
+        
+        # Realistic headers that vary slightly
+        headers = {
+            'User-Agent': user_agent,
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-            'Accept-Language': 'en-GB,en;q=0.9,en-US;q=0.8',
+            'Accept-Language': random.choice(['en-GB,en;q=0.9,en-US;q=0.8', 'en-US,en;q=0.9', 'en-GB,en;q=0.8']),
             'Accept-Encoding': 'gzip, deflate, br',
             'Connection': 'keep-alive',
             'Upgrade-Insecure-Requests': '1',
             'Sec-Fetch-Dest': 'document',
             'Sec-Fetch-Mode': 'navigate',
-            'Sec-Fetch-Site': 'none',
-            'Cache-Control': 'max-age=0',
-        })
-        return session
+            'Sec-Fetch-Site': random.choice(['none', 'same-origin', 'cross-site']),
+            'Cache-Control': random.choice(['no-cache', 'max-age=0']),
+            'DNT': random.choice(['1', '0']),
+        }
+        
+        # Sometimes add additional headers
+        if random.random() > 0.5:
+            headers['Sec-CH-UA'] = '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"'
+            headers['Sec-CH-UA-Mobile'] = '?0'
+            headers['Sec-CH-UA-Platform'] = f'"{random.choice(["Windows", "macOS", "Linux"])}"'
+        
+        self.session.headers.update(headers)
+        self.session_requests = 0
+        
+        print(f"🔄 New session created (User-Agent: {user_agent[:50]}...)")
+    
+    def _smart_delay(self):
+        """Implement smart delay with randomization to avoid detection"""
+        current_time = time.time()
+        time_since_last = current_time - self.last_request_time
+        
+        # Base delay with randomization
+        base_delay = random.uniform(self.delay_min, self.delay_max)
+        
+        # Add extra delay if making requests too quickly
+        if time_since_last < 2:
+            extra_delay = random.uniform(2, 5)
+            print(f"   ⏳ Quick succession detected, adding {extra_delay:.1f}s delay")
+            base_delay += extra_delay
+        
+        # Progressive delay - longer delays as we make more requests
+        if self.request_count > 10:
+            progressive_delay = (self.request_count - 10) * 0.5
+            base_delay += progressive_delay
+            if progressive_delay > 1:
+                print(f"   ⏳ Progressive delay: +{progressive_delay:.1f}s")
+        
+        print(f"   ⏱️ Waiting {base_delay:.1f} seconds...")
+        time.sleep(base_delay)
+        self.last_request_time = time.time()
+    
+    def _make_safe_request(self, url, max_retries=RETRY_ATTEMPTS):
+        """Make a request with anti-detection measures"""
+        
+        # Create new session if needed
+        if self.session is None or self.session_requests >= MAX_REQUESTS_PER_SESSION:
+            self._create_new_session()
+        
+        # Smart delay before request (except first request)
+        if self.request_count > 0:
+            self._smart_delay()
+        
+        for attempt in range(max_retries):
+            try:
+                print(f"   📡 Making request (attempt {attempt + 1}/{max_retries})")
+                
+                response = self.session.get(url, timeout=30)
+                self.request_count += 1
+                self.session_requests += 1
+                
+                # Check for anti-bot responses
+                if response.status_code == 200:
+                    # Check for eBay's anti-bot page content
+                    response_text_lower = response.text.lower()
+                    if any(phrase in response_text_lower for phrase in [
+                        'blocked', 'captcha', 'security check', 'suspicious activity',
+                        'temporarily unavailable', 'access denied', 'spam'
+                    ]):
+                        print(f"   🚫 Anti-bot detection triggered (attempt {attempt + 1})")
+                        if attempt < max_retries - 1:
+                            wait_time = 30 + attempt * 15
+                            print(f"   ⏳ Waiting {wait_time}s and creating new session...")
+                            time.sleep(wait_time)
+                            self._create_new_session()
+                            continue
+                        else:
+                            print(f"   ❌ All attempts failed - blocked by eBay")
+                            return None
+                    else:
+                        print(f"   ✅ Success! ({len(response.content)} bytes)")
+                        return response
+                
+                elif response.status_code == 403:
+                    print(f"   🚫 403 Forbidden - likely blocked (attempt {attempt + 1})")
+                    if attempt < max_retries - 1:
+                        wait_time = 60 + attempt * 30
+                        print(f"   ⏳ Waiting {wait_time}s and creating new session...")
+                        time.sleep(wait_time)
+                        self._create_new_session()
+                        continue
+                
+                elif response.status_code == 429:
+                    print(f"   ⏳ 429 Rate Limited (attempt {attempt + 1})")
+                    if attempt < max_retries - 1:
+                        wait_time = (2 ** attempt) * 30
+                        print(f"   ⏳ Exponential backoff: {wait_time}s")
+                        time.sleep(wait_time)
+                        self._create_new_session()
+                        continue
+                
+                else:
+                    print(f"   ❌ Status {response.status_code} (attempt {attempt + 1})")
+                    if attempt < max_retries - 1:
+                        time.sleep(10 + attempt * 5)
+                        continue
+                
+            except requests.exceptions.Timeout:
+                print(f"   ⏰ Timeout (attempt {attempt + 1})")
+                if attempt < max_retries - 1:
+                    time.sleep(15)
+                    continue
+            
+            except requests.exceptions.RequestException as e:
+                print(f"   ❌ Request error: {e} (attempt {attempt + 1})")
+                if attempt < max_retries - 1:
+                    time.sleep(10)
+                    continue
+        
+        print(f"   ❌ All {max_retries} attempts failed")
+        return None
     
     def extract_prices_from_html(self, html_content, query_terms):
-        """Extract prices from eBay HTML using pattern matching"""
+        """Extract prices from eBay HTML using pattern matching with better error handling"""
         prices = []
         excluded_count = 0
-        soup = BeautifulSoup(html_content, 'html.parser')
         
-        # Find all price patterns
-        price_pattern = r'£([\d,]+\.?\d*)'
-        all_prices = re.findall(price_pattern, html_content)
-        
-        print(f"   Found {len(all_prices)} total price patterns")
-        
-        # Get all text and split into sections
-        all_text = soup.get_text()
-        query_words = [word.lower() for word in query_terms.split() if len(word) > 2]
-        
-        # Find relevant sections containing our search terms
-        relevant_sections = []
-        lines = all_text.split('\n')
-        
-        for i, line in enumerate(lines):
-            line_lower = line.lower().strip()
-            if any(word in line_lower for word in query_words) and len(line_lower) > 5:
-                # Get surrounding context
-                start = max(0, i-3)
-                end = min(len(lines), i+4)
-                section = ' '.join(lines[start:end])
-                relevant_sections.append(section)
-        
-        print(f"   Found {len(relevant_sections)} relevant sections")
-        
-        # Extract prices from relevant sections with filtering
-        section_prices = []
-        for section in relevant_sections:
-            section_lower = section.lower()
+        try:
+            soup = BeautifulSoup(html_content, 'html.parser')
             
-            # Check for exclusion keywords
-            excluded_reasons = []
-            for keyword in self.exclude_keywords:
-                if keyword.lower() in section_lower:
-                    excluded_reasons.append(keyword)
+            # Check if we got a proper eBay page
+            page_text = soup.get_text()[:1000].lower()
+            if 'ebay' not in page_text:
+                print("   ⚠️ Warning: Page doesn't appear to be eBay")
+                return []
             
-            if excluded_reasons:
-                excluded_count += 1
-                if len(excluded_reasons) <= 2:  # Only show first few reasons to avoid spam
-                    print(f"   ❌ Excluded listing: {excluded_reasons[0]}")
-                continue
+            # Check for anti-bot content
+            if any(phrase in page_text for phrase in ['blocked', 'captcha', 'security check']):
+                print("   🚫 Anti-bot page detected in HTML content")
+                return []
             
-            # Find prices in this section
-            section_price_matches = re.findall(price_pattern, section)
-            for price_str in section_price_matches:
-                try:
-                    price = float(price_str.replace(',', ''))
-                    if self.price_range[0] <= price <= self.price_range[1]:
-                        section_prices.append(price)
-                except ValueError:
+            # Find all price patterns
+            price_pattern = r'£([\d,]+\.?\d*)'
+            all_prices = re.findall(price_pattern, html_content)
+            
+            print(f"   Found {len(all_prices)} total price patterns")
+            
+            # Get all text and split into sections
+            all_text = soup.get_text()
+            query_words = [word.lower() for word in query_terms.split() if len(word) > 2]
+            
+            # Find relevant sections containing our search terms
+            relevant_sections = []
+            lines = all_text.split('\n')
+            
+            for i, line in enumerate(lines):
+                line_lower = line.lower().strip()
+                if any(word in line_lower for word in query_words) and len(line_lower) > 5:
+                    # Get surrounding context
+                    start = max(0, i-3)
+                    end = min(len(lines), i+4)
+                    section = ' '.join(lines[start:end])
+                    relevant_sections.append(section)
+            
+            print(f"   Found {len(relevant_sections)} relevant sections")
+            
+            # Extract prices from relevant sections with filtering
+            section_prices = []
+            for section in relevant_sections:
+                section_lower = section.lower()
+                
+                # Check for exclusion keywords
+                excluded_reasons = []
+                for keyword in self.exclude_keywords:
+                    if keyword.lower() in section_lower:
+                        excluded_reasons.append(keyword)
+                
+                if excluded_reasons:
+                    excluded_count += 1
+                    if excluded_count <= 3:  # Only show first few to avoid spam
+                        print(f"   ❌ Excluded listing: {excluded_reasons[0]}")
                     continue
-        
-        print(f"   Found {len(section_prices)} valid prices after filtering")
-        if excluded_count > 0:
-            print(f"   🚫 Excluded {excluded_count} listings due to filter keywords")
-        
-        # If no contextual prices, fall back to all prices in range
-        if section_prices:
-            prices = section_prices
-        else:
-            for price_str in all_prices:
-                try:
-                    price = float(price_str.replace(',', ''))
-                    if self.price_range[0] <= price <= self.price_range[1]:
-                        prices.append(price)
-                except ValueError:
-                    continue
-        
-        # Remove obvious duplicates (UI elements)
-        if len(prices) > 10:
-            price_counts = {}
-            for price in prices:
-                price_counts[price] = price_counts.get(price, 0) + 1
+                
+                # Find prices in this section
+                section_price_matches = re.findall(price_pattern, section)
+                for price_str in section_price_matches:
+                    try:
+                        price = float(price_str.replace(',', ''))
+                        if self.price_range[0] <= price <= self.price_range[1]:
+                            section_prices.append(price)
+                    except ValueError:
+                        continue
             
-            # Remove prices appearing too frequently
-            max_allowed = len(prices) * 0.3
-            filtered_prices = [price for price, count in price_counts.items() 
-                             if count <= max_allowed]
-            if len(filtered_prices) >= 3:
-                prices = filtered_prices
-        
-        return prices
+            print(f"   Found {len(section_prices)} valid prices after filtering")
+            if excluded_count > 0:
+                print(f"   🚫 Excluded {excluded_count} listings due to filter keywords")
+            
+            # If no contextual prices, fall back to all prices in range
+            if section_prices:
+                prices = section_prices
+            else:
+                for price_str in all_prices:
+                    try:
+                        price = float(price_str.replace(',', ''))
+                        if self.price_range[0] <= price <= self.price_range[1]:
+                            prices.append(price)
+                    except ValueError:
+                        continue
+            
+            # Remove obvious duplicates (UI elements)
+            if len(prices) > 10:
+                price_counts = {}
+                for price in prices:
+                    price_counts[price] = price_counts.get(price, 0) + 1
+                
+                # Remove prices appearing too frequently
+                max_allowed = len(prices) * 0.3
+                filtered_prices = [price for price, count in price_counts.items() 
+                                 if count <= max_allowed]
+                if len(filtered_prices) >= 3:
+                    prices = filtered_prices
+            
+            return prices
+            
+        except Exception as e:
+            print(f"   ❌ Error extracting prices: {e}")
+            return []
     
     def scrape_item_prices(self, query, max_results=50, category=None):
-        """Scrape eBay sold listings for any item"""
+        """Scrape eBay sold listings with anti-detection measures"""
         print(f"🔍 Searching for: '{query}'")
+        print(f"🔢 Total requests made so far: {self.request_count}")
         
         all_prices = []
         
@@ -239,25 +424,34 @@ class UniversalPriceScraper:
         if category:
             params['_sacat'] = str(category)
         
-        # Try different URL formats
+        # Try different URL formats (eBay.com sometimes works when .co.uk is blocked)
         base_urls = [
             "https://www.ebay.co.uk/sch/i.html",
+            "https://www.ebay.com/sch/i.html",  # Fallback to US site
         ]
         
         for base_url in base_urls:
             try:
-                # Build full URL
-                param_string = "&".join([f"{k}={quote(str(v))}" for k, v in params.items()])
+                # Build URL with some randomization to avoid detection
+                param_list = []
+                for k, v in params.items():
+                    param_list.append(f"{k}={quote(str(v))}")
+                
+                # Sometimes shuffle parameter order (minor obfuscation)
+                if random.random() > 0.5:
+                    random.shuffle(param_list)
+                
+                param_string = "&".join(param_list)
                 full_url = f"{base_url}?{param_string}"
                 
-                print(f"   Fetching data...")
-                response = self.session.get(full_url, timeout=30)
+                print(f"   🌐 Trying: {base_url}")
                 
-                if response.status_code != 200:
-                    print(f"   ❌ Status code: {response.status_code}")
+                # Make the request with anti-detection
+                response = self._make_safe_request(full_url)
+                
+                if not response:
+                    print(f"   ❌ Failed to get response from {base_url}")
                     continue
-                
-                print(f"   ✅ Got response ({len(response.content)} bytes)")
                 
                 # Extract prices
                 prices = self.extract_prices_from_html(response.text, query)
@@ -265,15 +459,13 @@ class UniversalPriceScraper:
                 if prices:
                     all_prices.extend(prices)
                     print(f"   ✅ Found {len(prices)} prices")
-                    break
+                    break  # Success!
                 else:
-                    print(f"   ⚠️ No prices found")
+                    print(f"   ⚠️ No prices found from {base_url}")
                 
             except Exception as e:
-                print(f"   ❌ Error: {e}")
+                print(f"   ❌ Error with {base_url}: {e}")
                 continue
-            
-            time.sleep(self.delay)
         
         # Remove duplicates
         unique_prices = list(set(all_prices))
@@ -442,78 +634,50 @@ def load_items_from_file(file_path):
         print(f"❌ Error loading file: {e}")
         return []
 
-def save_results(results, output_file, original_format='json'):
-    """Save results to JSON or Excel format"""
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    
-    # Prepare data for output
-    output_data = {
-        'results': results,
-        'metadata': {
-            'timestamp': timestamp,
-            'total_items': len(results),
-            'successful_scrapes': len([r for r in results if r.get('average_price') is not None]),
-            'scraper_version': 'Universal eBay Price Scraper v1.0'
-        }
-    }
-    
-    file_ext = os.path.splitext(output_file)[1].lower()
-    
+def save_results_with_template(results, template_file, output_file):
     try:
-        if file_ext in ['.xlsx', '.xls'] or original_format == 'excel':
-            # Save as Excel
-            if not file_ext in ['.xlsx', '.xls']:
-                output_file += '.xlsx'
-            
-            # Main results sheet
-            main_data = []
-            for result in results:
-                row = result.copy()
-                # Flatten any nested data
-                if 'original_data' in row:
-                    original = row.pop('original_data')
-                    for key, value in original.items():
-                        if key not in row:
-                            row[f'original_{key}'] = value
-                main_data.append(row)
-            
-            # Create Excel file with multiple sheets
-            with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
-                # Main results
-                pd.DataFrame(main_data).to_excel(writer, sheet_name='Results', index=False)
-                
-                # Summary statistics
-                successful = [r for r in results if r.get('average_price') is not None]
-                if successful:
-                    summary = {
-                        'Metric': ['Total Items', 'Successful Scrapes', 'Success Rate', 
-                                 'Average Price', 'Median Price', 'Min Price', 'Max Price'],
-                        'Value': [
-                            len(results),
-                            len(successful),
-                            f"{len(successful)/len(results)*100:.1f}%",
-                            f"£{np.mean([r['average_price'] for r in successful]):.2f}",
-                            f"£{np.median([r['average_price'] for r in successful]):.2f}",
-                            f"£{min([r['average_price'] for r in successful]):.2f}",
-                            f"£{max([r['average_price'] for r in successful]):.2f}"
-                        ]
-                    }
-                    pd.DataFrame(summary).to_excel(writer, sheet_name='Summary', index=False)
-            
-            print(f"✅ Results saved to Excel: {output_file}")
-        
-        else:
-            # Save as JSON (default)
-            if not file_ext == '.json':
-                output_file += '.json'
-            
-            with open(output_file, 'w', encoding='utf-8') as f:
-                json.dump(output_data, f, indent=2, ensure_ascii=False)
-            
-            print(f"✅ Results saved to JSON: {output_file}")
-    
+        df_template = pd.read_excel(template_file)
+        print(f"📑 Loaded template with {df_template.shape[0]} rows and {df_template.shape[1]} cols")
+
+
+        # Build results DataFrame
+        results_df = pd.DataFrame(results)
+
+
+        # Try to map based on column names in template
+        mapped_df = df_template.copy()
+        for col in mapped_df.columns:
+            col_lower = col.lower()
+            if "item" in col_lower and "name" in results_df:
+                mapped_df[col] = results_df.get("item_name")
+            elif "average" in col_lower and "average_price" in results_df:
+                mapped_df[col] = results_df.get("average_price")
+            elif "median" in col_lower and "median_price" in results_df:
+                mapped_df[col] = results_df.get("median_price")
+            elif "count" in col_lower and "sample_count" in results_df:
+                mapped_df[col] = results_df.get("sample_count")
+            elif "range" in col_lower and "price_range" in results_df:
+                mapped_df[col] = results_df.get("price_range")
+            elif "std" in col_lower and "standard_deviation" in results_df:
+                mapped_df[col] = results_df.get("standard_deviation")
+
+
+# Save output
+        mapped_df.to_excel(output_file, index=False)
+        print(f"✅ Results exported into template: {output_file}")
     except Exception as e:
-        print(f"❌ Error saving results: {e}")
+        print(f"❌ Error using template export: {e}")
+
+
+# === MODIFICATION in save_results ===
+def save_results(results, output_file, original_format='json', template_file=None):
+    """Save results to JSON, Excel, or template-based Excel"""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+    if template_file:
+        save_results_with_template(results, template_file, output_file)
+        return
 
 def interactive_mode():
     """Interactive mode for single item searches"""
@@ -709,7 +873,25 @@ def batch_mode(input_file, output_file=None):
                 print(f"   ⚠️ Insufficient data")
         
         results.append(result)
-        time.sleep(1)  # Brief pause between items
+        
+        # Enhanced safety delay between items in batch mode
+        if i < len(items):  # Don't delay after last item
+            # Calculate dynamic delay based on success/failure and request count
+            base_delay = random.uniform(8, 15)  # Longer base delay for batch processing
+            
+            # Add extra delay if we've made many requests
+            if scraper.request_count > 20:
+                extra_delay = (scraper.request_count - 20) * 0.3
+                base_delay += extra_delay
+                print(f"   ⏳ High request count, adding {extra_delay:.1f}s extra delay")
+            
+            # Add extra delay if last request failed
+            if not prices:
+                base_delay += random.uniform(5, 10)
+                print(f"   ⏳ Last request failed, adding extra caution delay")
+            
+            print(f"   ⏳ Safety delay between items: {base_delay:.1f} seconds")
+            time.sleep(base_delay)
     
     # Save results
     if not output_file:
