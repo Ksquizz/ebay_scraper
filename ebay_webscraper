@@ -1,404 +1,858 @@
+#!/usr/bin/env python3
+"""
+Universal eBay Price Scraper
+Based on the working GPU scraper, now supports any item type
+Supports Excel/JSON input and output formats
+"""
+
 import requests
 from bs4 import BeautifulSoup
 import json
 import numpy as np
+import pandas as pd
 import time
 import re
+import os
 from urllib.parse import quote
 from statistics import median
+from datetime import datetime
 
 # ========================
 # CONFIGURATION
 # ========================
-MAX_REQUESTS = 50
 REQUEST_DELAY = 2  # Seconds between requests
+DEFAULT_PRICE_RANGE = (5, 5000)  # Default min/max prices
 
-# Exclusion filters
-EXCLUDE_KEYWORDS = ["for parts", "spares", "faulty", "not working", "broken", "bundle", "system", "pc", "lot", "job lot", "combo", "mining", "damaged", "repair"]
+# Common exclusion filters (can be customized)
+DEFAULT_EXCLUDE_KEYWORDS = [
+    "for parts", "spares", "faulty", "not working", "broken", "bundle", 
+    "system", "lot", "job lot", "combo", "damaged", "repair", "untested"
+]
 
-# ========================
-# Fixed eBay Scraping Functions
-# ========================
-def get_session():
-    """Create a requests session with headers that look like a real browser"""
-    session = requests.Session()
-    session.headers.update({
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-        'Accept-Language': 'en-GB,en;q=0.9,en-US;q=0.8',
-        'Accept-Encoding': 'gzip, deflate, br',
-        'Connection': 'keep-alive',
-        'Upgrade-Insecure-Requests': '1',
-        'Sec-Fetch-Dest': 'document',
-        'Sec-Fetch-Mode': 'navigate',
-        'Sec-Fetch-Site': 'none',
-        'Cache-Control': 'max-age=0',
-    })
-    return session
-
-def extract_prices_from_html(html_content, query_terms):
-    """
-    Extract prices from eBay HTML using multiple methods
-    Since eBay changed structure, we'll use regex and text analysis
-    """
-    prices = []
-    titles_and_prices = []
-    
-    soup = BeautifulSoup(html_content, 'html.parser')
-    
-    # Method 1: Find all price patterns in the entire HTML
-    price_pattern = r'£([\d,]+\.?\d*)'
-    all_prices = re.findall(price_pattern, html_content)
-    
-    print(f"   Found {len(all_prices)} total price patterns")
-    
-    # Method 2: Look for structured data (JSON-LD, data attributes)
-    script_tags = soup.find_all('script', type='application/ld+json')
-    json_prices = []
-    
-    for script in script_tags:
-        try:
-            data = json.loads(script.string)
-            # Extract prices from structured data if available
-            if isinstance(data, list):
-                for item in data:
-                    if 'offers' in item and 'price' in item['offers']:
-                        json_prices.append(float(item['offers']['price']))
-        except:
-            continue
-    
-    print(f"   Found {len(json_prices)} prices in structured data")
-    
-    # Method 3: Look for listings with context
-    # eBay often has the item info in data attributes or nearby text
-    all_text = soup.get_text()
-    
-    # Split into potential listing blocks
-    # Look for patterns like "GTX 1060" followed by a price within reasonable distance
-    query_words = [word.lower() for word in query_terms.split() if len(word) > 2]
-    
-    # Find sections that mention our GPU
-    relevant_sections = []
-    lines = all_text.split('\n')
-    
-    for i, line in enumerate(lines):
-        line_lower = line.lower().strip()
-        if any(word in line_lower for word in query_words) and len(line_lower) > 10:
-            # Get surrounding lines for context
-            start = max(0, i-3)
-            end = min(len(lines), i+4)
-            section = ' '.join(lines[start:end])
-            relevant_sections.append(section)
-    
-    print(f"   Found {len(relevant_sections)} relevant sections")
-    
-    # Extract prices from relevant sections
-    section_prices = []
-    for section in relevant_sections:
-        # Skip sections with exclusion keywords
-        section_lower = section.lower()
-        if any(keyword in section_lower for keyword in EXCLUDE_KEYWORDS):
-            continue
-            
-        # Find prices in this section
-        section_price_matches = re.findall(price_pattern, section)
-        for price_str in section_price_matches:
-            try:
-                price = float(price_str.replace(',', ''))
-                if 20 <= price <= 3000:  # Reasonable GPU price range
-                    section_prices.append(price)
-                    titles_and_prices.append((section[:100], price))
-            except ValueError:
-                continue
-    
-    print(f"   Found {len(section_prices)} contextual prices")
-    
-    # Combine all methods, prioritizing contextual prices
-    if section_prices:
-        prices = section_prices
-    elif json_prices:
-        prices = json_prices
-    else:
-        # Fall back to all prices, filtered by range
-        for price_str in all_prices:
-            try:
-                price = float(price_str.replace(',', ''))
-                if 30 <= price <= 2500:  # GPU price range
-                    prices.append(price)
-            except ValueError:
-                continue
-    
-    # Remove obvious duplicates (same price appearing many times)
-    if len(prices) > 10:
-        price_counts = {}
-        for price in prices:
-            price_counts[price] = price_counts.get(price, 0) + 1
+# Predefined filter profiles for different item types
+FILTER_PROFILES = {
+    "graphics_card": [
+        # Condition filters
+        "for parts", "spares", "faulty", "not working", "broken", "damaged", 
+        "repair", "untested", "defective", "dead", "burnt", "fried",
         
-        # Remove prices that appear more than 30% of the time (likely UI elements)
-        max_allowed = len(prices) * 0.3
-        filtered_prices = [price for price, count in price_counts.items() if count <= max_allowed]
-        if len(filtered_prices) >= 5:
-            prices = filtered_prices
+        # Bundle/system filters
+        "bundle", "system", "pc", "computer", "build", "rig", "setup",
+        "lot", "job lot", "bulk", "wholesale", "multiple", "x2", "x3", "x4",
+        
+        # Mining related (often worn out)
+        "mining", "miner", "crypto", "bitcoin", "ethereum", "used for mining",
+        "mining rig", "farm", "24/7", "heavy use",
+        
+        # Parts/incomplete
+        "cooler only", "heatsink", "fan", "bracket", "box only", "manual only",
+        "screws", "cable", "adapter",
+        
+        # Modified/custom
+        "modified", "custom", "painted", "water cooled", "liquid cooled",
+        "bios mod", "flashed", "custom firmware"
+    ],
     
-    return prices, titles_and_prices
-
-def scrape_ebay_sold(query, max_results=50):
-    """
-    Scrape eBay sold listings using updated method
-    """
-    session = get_session()
-    all_prices = []
-    all_titles_prices = []
+    "laptop": [
+        "for parts", "spares", "faulty", "not working", "broken", "damaged",
+        "cracked screen", "dead", "won't boot", "motherboard issue",
+        "lot", "job lot", "bulk", "wholesale", "multiple",
+        "battery dead", "no charger", "missing keys", "liquid damage"
+    ],
     
-    # Try multiple URL formats
-    base_urls = [
-        "https://www.ebay.co.uk/sch/i.html",
-        "https://www.ebay.co.uk/sch/27386/i.html",  # Direct graphics card category
+    "phone": [
+        "for parts", "spares", "faulty", "not working", "broken", "damaged",
+        "cracked", "smashed", "water damage", "icloud locked", "blacklisted",
+        "lot", "job lot", "bulk", "wholesale", "multiple",
+        "no power", "dead", "motherboard", "logic board"
+    ],
+    
+    "camera": [
+        "for parts", "spares", "faulty", "not working", "broken", "damaged",
+        "shutter issue", "mirror stuck", "lens error", "dead",
+        "lot", "job lot", "bulk", "wholesale", "multiple",
+        "body only", "lens only", "no lens", "no battery", "no charger"
+    ],
+    
+    "console": [
+        "for parts", "spares", "faulty", "not working", "broken", "damaged",
+        "red ring", "ylod", "disc drive", "overheating", "dead",
+        "lot", "job lot", "bulk", "wholesale", "multiple", "bundle",
+        "no controller", "no cables", "console only"
+    ],
+    
+    "car_parts": [
+        "for parts", "salvage", "scrap", "damaged", "broken", "cracked",
+        "rusted", "corroded", "worn", "used condition", "needs repair",
+        "lot", "job lot", "bulk", "wholesale", "multiple"
+    ],
+    
+    "clothing": [
+        "damaged", "stained", "torn", "ripped", "holes", "faded",
+        "lot", "job lot", "bulk", "wholesale", "bundle",
+        "replica", "fake", "copy", "knockoff"
     ]
-    
-    for base_url in base_urls:
-        print(f"🔍 Trying URL format: {base_url}")
+}
+
+class UniversalPriceScraper:
+    def __init__(self, delay=REQUEST_DELAY, exclude_keywords=None, price_range=None, filter_profile=None):
+        self.delay = delay
+        self.price_range = price_range or DEFAULT_PRICE_RANGE
+        self.session = self._create_session()
         
-        # Build parameters
+        # Set up exclusion keywords
+        if exclude_keywords is not None:
+            self.exclude_keywords = exclude_keywords
+        elif filter_profile and filter_profile in FILTER_PROFILES:
+            self.exclude_keywords = FILTER_PROFILES[filter_profile]
+            print(f"📋 Using '{filter_profile}' filter profile ({len(self.exclude_keywords)} exclusions)")
+        else:
+            self.exclude_keywords = DEFAULT_EXCLUDE_KEYWORDS
+        
+        self.filter_profile = filter_profile
+        
+    def _create_session(self):
+        """Create a requests session with proper headers"""
+        session = requests.Session()
+        session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-GB,en;q=0.9,en-US;q=0.8',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'none',
+            'Cache-Control': 'max-age=0',
+        })
+        return session
+    
+    def extract_prices_from_html(self, html_content, query_terms):
+        """Extract prices from eBay HTML using pattern matching"""
+        prices = []
+        excluded_count = 0
+        soup = BeautifulSoup(html_content, 'html.parser')
+        
+        # Find all price patterns
+        price_pattern = r'£([\d,]+\.?\d*)'
+        all_prices = re.findall(price_pattern, html_content)
+        
+        print(f"   Found {len(all_prices)} total price patterns")
+        
+        # Get all text and split into sections
+        all_text = soup.get_text()
+        query_words = [word.lower() for word in query_terms.split() if len(word) > 2]
+        
+        # Find relevant sections containing our search terms
+        relevant_sections = []
+        lines = all_text.split('\n')
+        
+        for i, line in enumerate(lines):
+            line_lower = line.lower().strip()
+            if any(word in line_lower for word in query_words) and len(line_lower) > 5:
+                # Get surrounding context
+                start = max(0, i-3)
+                end = min(len(lines), i+4)
+                section = ' '.join(lines[start:end])
+                relevant_sections.append(section)
+        
+        print(f"   Found {len(relevant_sections)} relevant sections")
+        
+        # Extract prices from relevant sections with filtering
+        section_prices = []
+        for section in relevant_sections:
+            section_lower = section.lower()
+            
+            # Check for exclusion keywords
+            excluded_reasons = []
+            for keyword in self.exclude_keywords:
+                if keyword.lower() in section_lower:
+                    excluded_reasons.append(keyword)
+            
+            if excluded_reasons:
+                excluded_count += 1
+                if len(excluded_reasons) <= 2:  # Only show first few reasons to avoid spam
+                    print(f"   ❌ Excluded listing: {excluded_reasons[0]}")
+                continue
+            
+            # Find prices in this section
+            section_price_matches = re.findall(price_pattern, section)
+            for price_str in section_price_matches:
+                try:
+                    price = float(price_str.replace(',', ''))
+                    if self.price_range[0] <= price <= self.price_range[1]:
+                        section_prices.append(price)
+                except ValueError:
+                    continue
+        
+        print(f"   Found {len(section_prices)} valid prices after filtering")
+        if excluded_count > 0:
+            print(f"   🚫 Excluded {excluded_count} listings due to filter keywords")
+        
+        # If no contextual prices, fall back to all prices in range
+        if section_prices:
+            prices = section_prices
+        else:
+            for price_str in all_prices:
+                try:
+                    price = float(price_str.replace(',', ''))
+                    if self.price_range[0] <= price <= self.price_range[1]:
+                        prices.append(price)
+                except ValueError:
+                    continue
+        
+        # Remove obvious duplicates (UI elements)
+        if len(prices) > 10:
+            price_counts = {}
+            for price in prices:
+                price_counts[price] = price_counts.get(price, 0) + 1
+            
+            # Remove prices appearing too frequently
+            max_allowed = len(prices) * 0.3
+            filtered_prices = [price for price, count in price_counts.items() 
+                             if count <= max_allowed]
+            if len(filtered_prices) >= 3:
+                prices = filtered_prices
+        
+        return prices
+    
+    def scrape_item_prices(self, query, max_results=50, category=None):
+        """Scrape eBay sold listings for any item"""
+        print(f"🔍 Searching for: '{query}'")
+        
+        all_prices = []
+        
+        # Build search parameters
         params = {
             '_nkw': query,
-            '_sacat': '27386',  # Graphics cards category
             'LH_Sold': '1',     # Sold listings only
             'LH_Complete': '1', # Completed listings
             '_ipg': '240',      # Max items per page
             'rt': 'nc',
-            '_udlo': '30',      # Minimum price £30
-            '_udhi': '2500',    # Maximum price £2500
+            '_udlo': str(self.price_range[0]),  # Min price
+            '_udhi': str(self.price_range[1]),  # Max price
             '_sop': '13',       # Sort by: time ending soonest
         }
         
-        # Build full URL
-        param_string = "&".join([f"{k}={v}" for k, v in params.items()])
-        full_url = f"{base_url}?{param_string}"
+        # Add category if specified
+        if category:
+            params['_sacat'] = str(category)
         
-        try:
-            print(f"   Fetching: {query}")
-            response = session.get(full_url, timeout=30)
-            
-            if response.status_code != 200:
-                print(f"   ❌ Status code: {response.status_code}")
-                continue
-                
-            print(f"   ✅ Got response ({len(response.content)} bytes)")
-            
-            # Extract prices using our new method
-            prices, titles_prices = extract_prices_from_html(response.text, query)
-            
-            if prices:
-                all_prices.extend(prices)
-                all_titles_prices.extend(titles_prices)
-                print(f"   ✅ Found {len(prices)} prices")
-                break  # Success with this URL format
-            else:
-                print(f"   ⚠️ No prices found with this URL format")
-                
-        except Exception as e:
-            print(f"   ❌ Error: {e}")
-            continue
-        
-        time.sleep(REQUEST_DELAY)
-    
-    # Remove duplicates while preserving order
-    seen_prices = set()
-    unique_prices = []
-    for price in all_prices:
-        if price not in seen_prices:
-            seen_prices.add(price)
-            unique_prices.append(price)
-    
-    # Limit results
-    if len(unique_prices) > max_results:
-        unique_prices = unique_prices[:max_results]
-    
-    print(f"✅ Total unique prices found: {len(unique_prices)}")
-    if unique_prices:
-        print(f"   Price range: £{min(unique_prices):.2f} - £{max(unique_prices):.2f}")
-        print(f"   Sample prices: {unique_prices[:5]}")
-    
-    return unique_prices
-
-def filter_outliers(prices):
-    """Remove outliers using IQR method"""
-    if len(prices) < 3:
-        mean_price = np.mean(prices) if prices else np.nan
-        return prices, mean_price, (np.nan, np.nan), np.nan
-
-    prices = np.array(prices)
-    
-    # IQR method
-    q1, q3 = np.percentile(prices, [25, 75])
-    iqr = q3 - q1
-    lower, upper = q1 - 1.5 * iqr, q3 + 1.5 * iqr
-    iqr_filtered = prices[(prices >= lower) & (prices <= upper)]
-
-    # If IQR removes too many, use a more conservative approach
-    if len(iqr_filtered) < len(prices) * 0.6:
-        # Use median absolute deviation instead
-        median_price = np.median(prices)
-        mad = np.median(np.abs(prices - median_price))
-        mad_lower, mad_upper = median_price - 3*mad, median_price + 3*mad
-        filtered = prices[(prices >= mad_lower) & (prices <= mad_upper)]
-    else:
-        filtered = iqr_filtered
-
-    # Calculate trimmed mean
-    if len(filtered) >= 6:
-        sorted_filtered = np.sort(filtered)
-        trim_count = max(1, int(len(sorted_filtered) * 0.1))
-        trimmed = sorted_filtered[trim_count:-trim_count]
-    else:
-        trimmed = filtered
-
-    corrected_mean = np.mean(trimmed) if len(trimmed) > 0 else np.nan
-    stddev_mean = np.std(filtered) if len(filtered) > 0 else np.nan
-    
-    return filtered.tolist(), corrected_mean, (lower, upper), stddev_mean
-
-def process_gpu_list(gpu_list, output_file="gpu_prices.json"):
-    """
-    Process a list of GPUs and scrape their prices
-    """
-    
-    gpu_comparison = []
-    samples_log = []
-    stats_log = []
-    
-    print(f"🚀 Starting price scraping for {len(gpu_list)} GPUs...")
-    
-    for i, gpu_info in enumerate(gpu_list, 1):
-        # Extract GPU name and VRAM
-        gpu_name = gpu_info.get('name', gpu_info.get('gpu', gpu_info.get('NVIDIA GPU', '')))
-        vram = gpu_info.get('vram', gpu_info.get('VRAM', ''))
-        
-        if not gpu_name:
-            print(f"⚠️ Skipping GPU {i}: No name found")
-            continue
-            
-        full_name = f"{gpu_name} {vram}".strip()
-        print(f"\n📊 Processing {i}/{len(gpu_list)}: {full_name}")
-        print("=" * 50)
-        
-        # Build search query - try multiple variations
-        queries = [
-            f"{gpu_name} {vram}".strip(),
-            f"{gpu_name} {vram} graphics card".strip(),
-            gpu_name.strip()
+        # Try different URL formats
+        base_urls = [
+            "https://www.ebay.co.uk/sch/i.html",
         ]
         
-        all_prices = []
-        
-        # Try each query variation
-        for query in queries:
-            if query:
-                print(f"🔍 Query: '{query}'")
-                prices = scrape_ebay_sold(query, max_results=30)
-                all_prices.extend(prices)
+        for base_url in base_urls:
+            try:
+                # Build full URL
+                param_string = "&".join([f"{k}={quote(str(v))}" for k, v in params.items()])
+                full_url = f"{base_url}?{param_string}"
                 
-                if len(all_prices) >= 15:  # Got enough data
+                print(f"   Fetching data...")
+                response = self.session.get(full_url, timeout=30)
+                
+                if response.status_code != 200:
+                    print(f"   ❌ Status code: {response.status_code}")
+                    continue
+                
+                print(f"   ✅ Got response ({len(response.content)} bytes)")
+                
+                # Extract prices
+                prices = self.extract_prices_from_html(response.text, query)
+                
+                if prices:
+                    all_prices.extend(prices)
+                    print(f"   ✅ Found {len(prices)} prices")
                     break
-                    
-                time.sleep(1)  # Brief pause between queries
+                else:
+                    print(f"   ⚠️ No prices found")
+                
+            except Exception as e:
+                print(f"   ❌ Error: {e}")
+                continue
+            
+            time.sleep(self.delay)
         
         # Remove duplicates
         unique_prices = list(set(all_prices))
         
-        if not unique_prices:
-            print(f"❌ No prices found for {full_name}")
-            gpu_comparison.append({
-                "GPU": full_name,
-                "Average_Price": None,
-                "Sample_Count": 0,
-                "Price_Range": "No data",
-                "Status": "No data found"
-            })
-            continue
+        # Limit results
+        if len(unique_prices) > max_results:
+            unique_prices = sorted(unique_prices)[:max_results]
         
-        # Process prices
-        raw_mean = np.mean(unique_prices)
-        filtered_prices, corrected_mean, iqr_range, stddev = filter_outliers(unique_prices)
+        print(f"✅ Final result: {len(unique_prices)} unique prices")
+        if unique_prices:
+            print(f"   Range: £{min(unique_prices):.2f} - £{max(unique_prices):.2f}")
+            print(f"   Sample: {unique_prices[:5]}")
         
-        # Store results
-        gpu_data = {
-            "GPU": full_name,
-            "Average_Price": round(corrected_mean, 2) if not np.isnan(corrected_mean) else None,
-            "Sample_Count": len(filtered_prices),
-            "Raw_Average": round(raw_mean, 2),
-            "Price_Range": f"£{min(filtered_prices):.2f} - £{max(filtered_prices):.2f}" if filtered_prices else "No data",
-            "Standard_Deviation": round(stddev, 2) if not np.isnan(stddev) else None,
-            "Median_Price": round(np.median(filtered_prices), 2) if filtered_prices else None,
-            "Status": "Success" if not np.isnan(corrected_mean) else "Insufficient data"
-        }
-        
-        gpu_comparison.append(gpu_data)
-        
-        # Log detailed stats
-        samples_log.append({
-            "GPU": full_name,
-            "Total_Samples": len(unique_prices),
-            "Valid_Samples": len(filtered_prices),
-            "Outliers_Removed": len(unique_prices) - len(filtered_prices),
-            "Queries_Tried": len([q for q in queries if q])
-        })
-        
-        print(f"📈 Results for {full_name}:")
-        print(f"   Average: £{corrected_mean:.2f}")
-        print(f"   Samples: {len(filtered_prices)}")
-        print(f"   Range: £{min(filtered_prices):.2f} - £{max(filtered_prices):.2f}")
+        return unique_prices
     
-    # Compile final results
-    results = {
-        "gpu_comparison": gpu_comparison,
-        "detailed_samples": samples_log,
-        "metadata": {
-            "scraping_timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "total_gpus": len(gpu_list),
-            "successful_scrapes": len([g for g in gpu_comparison if g["Average_Price"] is not None]),
-            "method": "Updated web scraping (2025)"
+    def filter_outliers(self, prices):
+        """Remove outliers using IQR method"""
+        if len(prices) < 3:
+            mean_price = np.mean(prices) if prices else np.nan
+            return prices, mean_price, np.nan
+        
+        prices = np.array(prices)
+        
+        # IQR method
+        q1, q3 = np.percentile(prices, [25, 75])
+        iqr = q3 - q1
+        lower, upper = q1 - 1.5 * iqr, q3 + 1.5 * iqr
+        iqr_filtered = prices[(prices >= lower) & (prices <= upper)]
+        
+        # If too many removed, use median absolute deviation
+        if len(iqr_filtered) < len(prices) * 0.6:
+            median_price = np.median(prices)
+            mad = np.median(np.abs(prices - median_price))
+            mad_lower = median_price - 3 * mad
+            mad_upper = median_price + 3 * mad
+            filtered = prices[(prices >= mad_lower) & (prices <= mad_upper)]
+        else:
+            filtered = iqr_filtered
+        
+        # Calculate trimmed mean
+        if len(filtered) >= 6:
+            sorted_filtered = np.sort(filtered)
+            trim_count = max(1, int(len(sorted_filtered) * 0.1))
+            trimmed = sorted_filtered[trim_count:-trim_count]
+        else:
+            trimmed = filtered
+        
+        mean_price = np.mean(trimmed) if len(trimmed) > 0 else np.nan
+        std_dev = np.std(filtered) if len(filtered) > 0 else np.nan
+        
+        return filtered.tolist(), mean_price, std_dev
+
+def load_items_from_file(file_path):
+    """Load items from Excel or JSON file with filter support"""
+    if not os.path.exists(file_path):
+        print(f"❌ File not found: {file_path}")
+        return []
+    
+    file_ext = os.path.splitext(file_path)[1].lower()
+    items = []
+    
+    try:
+        if file_ext in ['.xlsx', '.xls']:
+            # Load Excel file
+            df = pd.read_excel(file_path)
+            print(f"📊 Loaded Excel file with {len(df)} rows")
+            print(f"   Columns: {list(df.columns)}")
+            
+            # Try to identify relevant columns
+            item_col = None
+            category_col = None
+            filter_col = None
+            price_range_col = None
+            
+            for col in df.columns:
+                col_lower = col.lower()
+                if any(keyword in col_lower for keyword in ['item', 'product', 'name', 'gpu', 'search']):
+                    item_col = col
+                elif any(keyword in col_lower for keyword in ['category', 'cat', 'type']):
+                    category_col = col
+                elif any(keyword in col_lower for keyword in ['filter', 'profile', 'exclusion']):
+                    filter_col = col
+                elif any(keyword in col_lower for keyword in ['price', 'range', 'min', 'max']):
+                    price_range_col = col
+            
+            if not item_col:
+                item_col = df.columns[0]  # Use first column as item name
+                print(f"   Using '{item_col}' as item column")
+            
+            # Convert to list of dictionaries
+            for _, row in df.iterrows():
+                item_name = str(row[item_col]).strip()
+                if item_name and item_name.lower() not in ['nan', 'none', '']:
+                    item_data = {
+                        'name': item_name,
+                        'category': str(row[category_col]).strip() if category_col and not pd.isna(row[category_col]) else None,
+                        'filter_profile': str(row[filter_col]).strip() if filter_col and not pd.isna(row[filter_col]) else None,
+                        'original_data': dict(row)  # Keep original data for output
+                    }
+                    items.append(item_data)
+        
+        elif file_ext == '.json':
+            # Load JSON file
+            with open(file_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            
+            if isinstance(data, list):
+                # List of items
+                for item in data:
+                    if isinstance(item, dict):
+                        # Look for name/item field
+                        name = (item.get('name') or item.get('item') or 
+                               item.get('product') or item.get('search_term'))
+                        if name:
+                            items.append({
+                                'name': str(name).strip(),
+                                'category': item.get('category'),
+                                'filter_profile': item.get('filter_profile') or item.get('filter'),
+                                'original_data': item
+                            })
+                    elif isinstance(item, str):
+                        # Simple list of item names
+                        items.append({
+                            'name': item.strip(), 
+                            'original_data': {'name': item}
+                        })
+            
+            elif isinstance(data, dict):
+                # Dictionary format
+                if 'items' in data:
+                    # Process nested items list
+                    nested_items = data['items']
+                    if isinstance(nested_items, list):
+                        for item in nested_items:
+                            if isinstance(item, dict):
+                                name = (item.get('name') or item.get('item') or 
+                                       item.get('product') or item.get('product_name') or
+                                       item.get('search_term'))
+                                if name:
+                                    items.append({
+                                        'name': str(name).strip(),
+                                        'category': item.get('category') or item.get('ebay_category'),
+                                        'filter_profile': item.get('filter_profile') or item.get('filter'),
+                                        'original_data': item
+                                    })
+                            elif isinstance(item, str):
+                                items.append({
+                                    'name': item.strip(),
+                                    'original_data': {'name': item}
+                                })
+                else:
+                    # Single item
+                    name = data.get('name') or data.get('item') or data.get('product')
+                    if name:
+                        items.append({
+                            'name': str(name).strip(),
+                            'category': data.get('category'),
+                            'filter_profile': data.get('filter_profile') or data.get('filter'),
+                            'original_data': data
+                        })
+        
+        print(f"✅ Loaded {len(items)} items from {file_path}")
+        return items
+        
+    except Exception as e:
+        print(f"❌ Error loading file: {e}")
+        return []
+
+def save_results(results, output_file, original_format='json'):
+    """Save results to JSON or Excel format"""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    # Prepare data for output
+    output_data = {
+        'results': results,
+        'metadata': {
+            'timestamp': timestamp,
+            'total_items': len(results),
+            'successful_scrapes': len([r for r in results if r.get('average_price') is not None]),
+            'scraper_version': 'Universal eBay Price Scraper v1.0'
         }
     }
     
-    # Save to JSON
-    with open(output_file, 'w', encoding='utf-8') as f:
-        json.dump(results, f, indent=2, ensure_ascii=False)
+    file_ext = os.path.splitext(output_file)[1].lower()
     
-    print(f"\n✅ Results saved to {output_file}")
+    try:
+        if file_ext in ['.xlsx', '.xls'] or original_format == 'excel':
+            # Save as Excel
+            if not file_ext in ['.xlsx', '.xls']:
+                output_file += '.xlsx'
+            
+            # Main results sheet
+            main_data = []
+            for result in results:
+                row = result.copy()
+                # Flatten any nested data
+                if 'original_data' in row:
+                    original = row.pop('original_data')
+                    for key, value in original.items():
+                        if key not in row:
+                            row[f'original_{key}'] = value
+                main_data.append(row)
+            
+            # Create Excel file with multiple sheets
+            with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
+                # Main results
+                pd.DataFrame(main_data).to_excel(writer, sheet_name='Results', index=False)
+                
+                # Summary statistics
+                successful = [r for r in results if r.get('average_price') is not None]
+                if successful:
+                    summary = {
+                        'Metric': ['Total Items', 'Successful Scrapes', 'Success Rate', 
+                                 'Average Price', 'Median Price', 'Min Price', 'Max Price'],
+                        'Value': [
+                            len(results),
+                            len(successful),
+                            f"{len(successful)/len(results)*100:.1f}%",
+                            f"£{np.mean([r['average_price'] for r in successful]):.2f}",
+                            f"£{np.median([r['average_price'] for r in successful]):.2f}",
+                            f"£{min([r['average_price'] for r in successful]):.2f}",
+                            f"£{max([r['average_price'] for r in successful]):.2f}"
+                        ]
+                    }
+                    pd.DataFrame(summary).to_excel(writer, sheet_name='Summary', index=False)
+            
+            print(f"✅ Results saved to Excel: {output_file}")
+        
+        else:
+            # Save as JSON (default)
+            if not file_ext == '.json':
+                output_file += '.json'
+            
+            with open(output_file, 'w', encoding='utf-8') as f:
+                json.dump(output_data, f, indent=2, ensure_ascii=False)
+            
+            print(f"✅ Results saved to JSON: {output_file}")
+    
+    except Exception as e:
+        print(f"❌ Error saving results: {e}")
+
+def interactive_mode():
+    """Interactive mode for single item searches"""
+    print("\n🔍 INTERACTIVE SEARCH MODE")
+    print("=" * 40)
+    
+    while True:
+        # Get search term
+        search_term = input("\nEnter item to search for (or 'quit' to exit): ").strip()
+        
+        if search_term.lower() in ['quit', 'exit', 'q']:
+            break
+        
+        if not search_term:
+            print("Please enter a search term.")
+            continue
+        
+        # Show available filter profiles
+        print(f"\n📋 Available filter profiles:")
+        print("0. Default (basic filtering)")
+        for i, (profile_name, keywords) in enumerate(FILTER_PROFILES.items(), 1):
+            print(f"{i}. {profile_name} ({len(keywords)} exclusions)")
+        print(f"{len(FILTER_PROFILES)+1}. custom (enter your own keywords)")
+        
+        # Get filter choice
+        try:
+            filter_choice = input(f"\nChoose filter profile (0-{len(FILTER_PROFILES)+1}): ").strip()
+            
+            if filter_choice == '0' or filter_choice == '':
+                filter_profile = None
+                exclude_keywords = DEFAULT_EXCLUDE_KEYWORDS
+            elif filter_choice.isdigit() and 1 <= int(filter_choice) <= len(FILTER_PROFILES):
+                profile_name = list(FILTER_PROFILES.keys())[int(filter_choice)-1]
+                filter_profile = profile_name
+                exclude_keywords = None
+                print(f"✅ Using '{profile_name}' filter profile")
+            elif filter_choice == str(len(FILTER_PROFILES)+1):
+                # Custom keywords
+                custom_input = input("Enter exclusion keywords (comma-separated): ").strip()
+                if custom_input:
+                    exclude_keywords = [kw.strip().lower() for kw in custom_input.split(',')]
+                    filter_profile = None
+                    print(f"✅ Using custom filters: {exclude_keywords}")
+                else:
+                    exclude_keywords = DEFAULT_EXCLUDE_KEYWORDS
+                    filter_profile = None
+            else:
+                print("Invalid choice, using default filters")
+                exclude_keywords = DEFAULT_EXCLUDE_KEYWORDS
+                filter_profile = None
+        except:
+            exclude_keywords = DEFAULT_EXCLUDE_KEYWORDS
+            filter_profile = None
+        
+        # Optional category
+        category = input("Enter eBay category ID (optional, press Enter to skip): ").strip()
+        category = category if category.isdigit() else None
+        
+        # Optional price range
+        price_input = input("Enter price range as 'min,max' (optional, press Enter for default): ").strip()
+        price_range = DEFAULT_PRICE_RANGE
+        if price_input and ',' in price_input:
+            try:
+                min_price, max_price = map(float, price_input.split(','))
+                price_range = (min_price, max_price)
+            except ValueError:
+                print("Invalid price range format, using default.")
+        
+        # Create scraper with selected options
+        scraper = UniversalPriceScraper(
+            exclude_keywords=exclude_keywords,
+            filter_profile=filter_profile,
+            price_range=price_range
+        )
+        
+        print(f"\n🚀 Searching for: {search_term}")
+        print(f"💰 Price range: £{price_range[0]}-£{price_range[1]}")
+        if filter_profile:
+            print(f"🚫 Filter profile: {filter_profile}")
+        else:
+            print(f"🚫 Exclusions: {len(exclude_keywords)} keywords")
+        print("-" * 50)
+        
+        # Scrape prices
+        prices = scraper.scrape_item_prices(search_term, category=category)
+        
+        if not prices:
+            print("❌ No prices found.")
+            continue
+        
+        # Process results
+        filtered_prices, avg_price, std_dev = scraper.filter_outliers(prices)
+        
+        # Display results
+        print(f"\n📊 RESULTS FOR: {search_term}")
+        print(f"   Average Price: £{avg_price:.2f}")
+        print(f"   Sample Count: {len(filtered_prices)}")
+        print(f"   Price Range: £{min(filtered_prices):.2f} - £{max(filtered_prices):.2f}")
+        print(f"   Median: £{np.median(filtered_prices):.2f}")
+        print(f"   Std Dev: £{std_dev:.2f}")
+        
+        # Save option
+        save_option = input("\nSave results? (y/n): ").strip().lower()
+        if save_option == 'y':
+            filename = f"{search_term.replace(' ', '_')}_prices_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            
+            result_data = [{
+                'item_name': search_term,
+                'average_price': round(avg_price, 2),
+                'median_price': round(np.median(filtered_prices), 2),
+                'sample_count': len(filtered_prices),
+                'price_range': f"£{min(filtered_prices):.2f} - £{max(filtered_prices):.2f}",
+                'standard_deviation': round(std_dev, 2),
+                'filter_profile_used': filter_profile or 'custom',
+                'exclusions_applied': len(scraper.exclude_keywords),
+                'all_prices': filtered_prices
+            }]
+            
+            # Choose format
+            format_choice = input("Save as (j)son or (e)xcel? ").strip().lower()
+            if format_choice.startswith('e'):
+                save_results(result_data, filename, 'excel')
+            else:
+                save_results(result_data, filename, 'json')
+            if format_choice.startswith('e'):
+                save_results(result_data, filename, 'excel')
+            else:
+                save_results(result_data, filename, 'json')
+
+def batch_mode(input_file, output_file=None):
+    """Batch mode for processing multiple items from file"""
+    print(f"\n📁 BATCH PROCESSING MODE")
+    print(f"Input file: {input_file}")
+    print("=" * 50)
+    
+    # Load items
+    items = load_items_from_file(input_file)
+    
+    if not items:
+        print("❌ No items loaded from file.")
+        return
+    
+    results = []
+    
+    print(f"🚀 Processing {len(items)} items...")
+    
+    for i, item in enumerate(items, 1):
+        item_name = item['name']
+        category = item.get('category')
+        filter_profile = item.get('filter_profile')
+        
+        print(f"\n📊 Processing {i}/{len(items)}: {item_name}")
+        if filter_profile:
+            print(f"   Using filter profile: {filter_profile}")
+        print("-" * 50)
+        
+        # Create scraper with item-specific settings
+        scraper = UniversalPriceScraper(filter_profile=filter_profile)
+        
+        # Scrape prices
+        prices = scraper.scrape_item_prices(item_name, category=category)
+        
+        if not prices:
+            result = {
+                'item_name': item_name,
+                'average_price': None,
+                'sample_count': 0,
+                'status': 'No data found',
+                'filter_profile_used': filter_profile,
+                'original_data': item['original_data']
+            }
+        else:
+            # Process results
+            filtered_prices, avg_price, std_dev = scraper.filter_outliers(prices)
+            
+            result = {
+                'item_name': item_name,
+                'average_price': round(avg_price, 2) if not np.isnan(avg_price) else None,
+                'median_price': round(np.median(filtered_prices), 2) if filtered_prices else None,
+                'sample_count': len(filtered_prices),
+                'price_range': f"£{min(filtered_prices):.2f} - £{max(filtered_prices):.2f}" if filtered_prices else "N/A",
+                'standard_deviation': round(std_dev, 2) if not np.isnan(std_dev) else None,
+                'status': 'Success' if not np.isnan(avg_price) else 'Insufficient data',
+                'filter_profile_used': filter_profile or 'default',
+                'exclusions_applied': len(scraper.exclude_keywords),
+                'all_prices': filtered_prices if len(filtered_prices) <= 50 else filtered_prices[:50],  # Limit stored prices
+                'original_data': item['original_data']
+            }
+            
+            if not np.isnan(avg_price):
+                print(f"   ✅ Average: £{avg_price:.2f} (n={len(filtered_prices)})")
+            else:
+                print(f"   ⚠️ Insufficient data")
+        
+        results.append(result)
+        time.sleep(1)  # Brief pause between items
+    
+    # Save results
+    if not output_file:
+        # Generate output filename based on input
+        base_name = os.path.splitext(os.path.basename(input_file))[0]
+        input_ext = os.path.splitext(input_file)[1].lower()
+        output_file = f"{base_name}_results"
+        original_format = 'excel' if input_ext in ['.xlsx', '.xls'] else 'json'
+    else:
+        original_format = 'excel' if output_file.endswith(('.xlsx', '.xls')) else 'json'
+    
+    save_results(results, output_file, original_format)
     
     # Print summary
-    successful = [g for g in gpu_comparison if g["Average_Price"] is not None]
-    print(f"\n📈 FINAL SUMMARY:")
-    print(f"Total GPUs processed: {len(gpu_comparison)}")
-    print(f"Successful price finds: {len(successful)}")
-    print(f"Success rate: {len(successful)/len(gpu_comparison)*100:.1f}%")
+    successful = [r for r in results if r['average_price'] is not None]
+    print(f"\n🎉 BATCH PROCESSING COMPLETE!")
+    print(f"Total items: {len(results)}")
+    print(f"Successful: {len(successful)}")
+    print(f"Success rate: {len(successful)/len(results)*100:.1f}%")
     
     if successful:
-        print(f"\n💰 Price Results:")
-        for gpu in successful:
-            print(f"  {gpu['GPU']}: £{gpu['Average_Price']} (n={gpu['Sample_Count']})")
-    
-    return results
+        avg_prices = [r['average_price'] for r in successful]
+        print(f"Overall average price: £{np.mean(avg_prices):.2f}")
+        print(f"Price range: £{min(avg_prices):.2f} - £{max(avg_prices):.2f}")
 
-# ========================
-# Example Usage
-# ========================
+def main():
+    """Main function with menu system"""
+    print("🌐 UNIVERSAL EBAY PRICE SCRAPER")
+    print("=" * 50)
+    print("Choose mode:")
+    print("1. Interactive mode (single item searches)")
+    print("2. Batch mode (process file)")
+    print("3. Create sample input files")
+    print("4. View available filter profiles")
+    
+    choice = input("\nEnter choice (1-4): ").strip()
+    
+    if choice == '1':
+        interactive_mode()
+    
+    elif choice == '2':
+        input_file = input("Enter input file path: ").strip().strip('"')
+        output_file = input("Enter output file path (optional, press Enter for auto): ").strip().strip('"')
+        output_file = output_file if output_file else None
+        batch_mode(input_file, output_file)
+    
+    elif choice == '3':
+        # Create sample files
+        print("\n📁 Creating sample input files...")
+        
+        # Sample JSON with filters
+        sample_json = [
+            {
+                "name": "RTX 2080 Super",
+                "category": "27386",
+                "filter_profile": "graphics_card"
+            },
+            {
+                "name": "iPhone 14 Pro",
+                "category": "9355",
+                "filter_profile": "phone"
+            },
+            {
+                "name": "MacBook Pro M2",
+                "category": "111422",
+                "filter_profile": "laptop"
+            },
+            {
+                "name": "Sony PS5 Console",
+                "category": "139971",
+                "filter_profile": "console"
+            },
+            {
+                "name": "Canon EOS R5",
+                "category": "625",
+                "filter_profile": "camera"
+            }
+        ]
+        
+        with open("sample_items_with_filters.json", "w") as f:
+            json.dump(sample_json, f, indent=2)
+        
+        # Sample Excel with filters
+        sample_df = pd.DataFrame([
+            {
+                "Item Name": "RTX 3080 Ti",
+                "Category": "27386",
+                "Filter Profile": "graphics_card",
+                "Notes": "High-end GPU"
+            },
+            {
+                "Item Name": "Dell XPS 13",
+                "Category": "177",
+                "Filter Profile": "laptop",
+                "Notes": "Ultrabook"
+            },
+            {
+                "Item Name": "Nike Air Jordan 1",
+                "Category": "15709",
+                "Filter Profile": "clothing",
+                "Notes": "Sneakers"
+            },
+            {
+                "Item Name": "BMW E90 Headlight",
+                "Category": "6028",
+                "Filter Profile": "car_parts",
+                "Notes": "Car parts"
+            },
+        ])
+        
+        sample_df.to_excel("sample_items_with_filters.xlsx", index=False)
+        
+        print("✅ Created sample files with filter profiles:")
+        print("   - sample_items_with_filters.json")
+        print("   - sample_items_with_filters.xlsx")
+        print("\nEdit these files with your items and run batch mode!")
+    
+    elif choice == '4':
+        # Show available filter profiles
+        print("\n📋 AVAILABLE FILTER PROFILES:")
+        print("=" * 50)
+        
+        for profile_name, keywords in FILTER_PROFILES.items():
+            print(f"\n🔍 {profile_name.upper()}")
+            print(f"   Exclusions: {len(keywords)} keywords")
+            print(f"   Examples: {', '.join(keywords[:8])}{'...' if len(keywords) > 8 else ''}")
+        
+        print(f"\n💡 How to use:")
+        print(f"   - In interactive mode: Choose the profile number")
+        print(f"   - In Excel files: Add 'Filter Profile' column with profile name")
+        print(f"   - In JSON files: Add 'filter_profile' field with profile name")
+        
+        # Show example usage
+        print(f"\n📝 Example JSON with filter:")
+        example = {
+            "name": "RTX 2080 Super",
+            "category": "27386",
+            "filter_profile": "graphics_card"
+        }
+        print(json.dumps(example, indent=2))
+    
+    else:
+        print("Invalid choice.")
+
 if __name__ == "__main__":
-    # Test with popular, common GPUs (more likely to have sold listings)
-    test_gpus = [
-        {"name": "GTX 1060", "vram": "6GB"},    # Very common
-        {"name": "GTX 1660", "vram": "6GB"},    # Common
-        {"name": "RTX 3060", "vram": "12GB"},   # Popular current gen
-    ]
-    
-    print("🌐 GPU Price Scraper - Fixed Version (2025)")
-    print("Using updated eBay scraping methods")
-    print("=" * 60)
-    
-    # Process the GPUs
-    results = process_gpu_list(test_gpus, "gpu_prices_fixed.json")
-    
-    print(f"\n🎉 Scraping complete!")
-    print(f"Check 'gpu_prices_fixed.json' for detailed results")
+    main()
